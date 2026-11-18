@@ -1,0 +1,31 @@
+{
+  "mimeTypes": { ".ps1": "text/plain" },
+  "navigationFallback": {
+    "rewrite": "/index.html",
+    "exclude": ["/api/*", "/.auth/*", "/auth-redirect.html", "/assets/*", "/docs/*", "/scripts/*", "/*.{css,js,json,png,jpg,svg,ico,txt,ps1}"]
+  },
+  "routes": [
+    {
+      "route": "/auth-redirect.html",
+      "headers": {
+        "Cache-Control": "no-store",
+        "Content-Security-Policy": "default-src 'none'; script-src 'self'; connect-src 'self'; base-uri 'none'; frame-ancestors 'self'; form-action 'none'",
+        "X-Frame-Options": "SAMEORIGIN"
+      }
+    },
+    {
+      "route": "/assets/*",
+      "headers": {
+        "Cache-Control": "public, max-age=31536000, immutable"
+      }
+    }
+  ],
+  "globalHeaders": {
+    "Cache-Control": "no-cache",
+    "Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self' https://login.microsoftonline.com https://func-aznetsim-cloud-m75jjiu3x4xw2.azurewebsites.net; frame-src 'self' https://login.microsoftonline.com https://login.live.com; font-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'; form-action 'self'",
+    "Referrer-Policy": "no-referrer",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=()"
+  }
+}

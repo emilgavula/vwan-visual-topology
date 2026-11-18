@@ -1,0 +1,690 @@
+import { canonicalLocation, type BicepExport } from '../bicep-export'
+import { cidr, ipv4 } from '../validation'
+import type { AzNetTopology, AzVNet } from './model'
+import { azArsPeers, azArsSpokes } from './ars-route-maps'
+import { natGatewayForSubnet, validateInventory } from '../inventory'
+import { generateConnectivityBicep } from '../connectivity-bicep'
+import { validateSubnetPeeringScopes } from './subnet-peering'
+
+export interface AzNetBicepOptions {
+  defaultLocation?: string
+  includeGateways?: boolean
+  includeRouteServers?: boolean
+  includeGatewayConnections?: boolean
+}
+
+function bicepIdentifier(raw: string, prefix = 'res'): string {
+  const cleaned = raw
+    .replace(/[^a-zA-Z0-9_]/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/^_+|_+$/g, '')
+  if (!cleaned) return prefix
+  return /^[0-9]/.test(cleaned) ? `${prefix}_${cleaned}` : cleaned
+}
+
+function escapeBicepString(value: string): string {
+  return value.replace(/\\/g, '\\\\').replace(/'/g, "\\'")
+}
+
+function resolveVnetLocation(vnet: AzVNet, fallback: string): string {
+  return canonicalLocation(vnet.region) || fallback || 'swedencentral'
+}
+
+export function generateAzNetBicep(
+  topology: AzNetTopology,
+  options: AzNetBicepOptions = {},
+): BicepExport {
+  validateInventory(topology)
+  const peeringErrors = validateSubnetPeeringScopes(topology)
+  if (peeringErrors.length) throw new Error(peeringErrors.join(' '))
+  const defaultLoc =
+    canonicalLocation(options.defaultLocation ?? '') ||
+    canonicalLocation(topology.vnets[0]?.region ?? '') ||
+    'swedencentral'
+  const includeGateways = options.includeGateways ?? true
+  const includeRouteServers = options.includeRouteServers ?? true
+
+  const warnings: string[] = []
+  if (topology.vnetPeerings.some((peering) => peering.scope?.type === 'subnets')) {
+    warnings.push('Subnet peering exports explicit peerCompleteVnets=false and mirrored subnet names. Azure subscription allowlisting, current VM SKU prerequisites and live deployment are not verified. Changing whole-VNet/subnet type requires deleting/recreating the Azure peering; membership edits update and synchronize the existing link. Delegations and unsupported transit composition are not an equivalent deployment.')
+  }
+  if (topology.vnets.some((vnet) => vnet.appliances.some((app) => app.kind === 'vnra'))) {
+    warnings.push('Managed VNRA appliances are not deployed by this Bicep starter. UDRs may reference their private IPs, but the forwarding resources are omitted. Preserve native JSON and deploy VNRA separately; this is not an equivalent transit deployment.')
+  }
+  if (topology.vwanHubs.some((hub) => hub.firewall)) warnings.push('Declared local hub Firewall identities and static inspection are not deployed by this Bicep starter; preserve native JSON. This is not an equivalent inspection deployment.')
+  if (topology.vpnConnections.some((connection) => connection.nat)) warnings.push('VPN overlap NAT rules, gateway capabilities, instance associations and BGP translation are not deployed by this Bicep starter. Preserve native JSON; generated gateways/connections are not an equivalent NAT deployment.')
+  if (topology.inventory?.routerSnatPolicies?.length) warnings.push('Firewall network-rule SNAT/private ranges and NVA guest SNAT are simulation declarations, not deployed by this Bicep starter. Preserve native JSON and configure original device policies separately.')
+  if (topology.vnets.some((vnet) => vnet.subnets.some((subnet) => subnet.defaultOutboundAccess === undefined))) {
+    warnings.push('Legacy unspecified defaultOutboundAccess is preserved as unspecified; Azure deployment defaults can differ. Set it explicitly for a reproducible outbound posture.')
+  }
+  if (topology.vwanHubs.some((hub) => hub.routeTables?.length || hub.routeTablesStatus)
+    || topology.vnets.some((vnet) => vnet.vwanHubAttachment?.hubRouting)
+    || [...topology.erLinks, ...topology.vpnConnections].some((link) => link.hubRouting)) {
+    warnings.push('Mixed hub custom tables, association and propagation settings are not deployed by this Bicep starter. Preserve JSON and configure these settings explicitly before deployment.')
+  }
+  if (topology.routeMaps?.length) {
+    if (topology.routeMaps.some((map) => map.siteId)) warnings.push('On-premises site route maps are simulation/device policies and are not deployed by this Azure Bicep export. Configure the corresponding site routers separately.')
+    if (topology.routeMaps.some((map) => map.hubId)) warnings.push('Mixed Virtual WAN hub route maps and connection assignments are not deployed by this Bicep starter. Preserve native JSON and configure hub policies explicitly.')
+  }
+  if (topology.allowBranchToBranchTraffic === false || topology.vpnConnections.some((connection) => connection.transport === 'SDWAN'
+    || connection.learnSiteRoutes !== undefined || connection.propagateDefaultRoute !== undefined)
+    || topology.erLinks.some((link) => link.learnSiteRoutes !== undefined || link.propagateDefaultRoute !== undefined)
+    || topology.vnets.some((vnet) => vnet.appliances.some((app) => app.vwanBgpEnabled))) {
+    warnings.push('WAN branch controls, integrated SD-WAN and spoke NVA BGP peering require explicit configuration; this Bicep starter does not deploy them. Preserve native JSON.')
+  }
+  if (topology.vnets.some((vnet) => vnet.routeServer?.routeMaps?.length)) {
+    warnings.push(includeRouteServers
+      ? 'Eligible ARS route-map definitions and local BGP/peered-spoke associations are exported as a Bicep starter, not a verified Azure deployment. Review API 2026-03-01 availability and reserved-community replacement behavior before deployment; current Bicep types may not validate those resource properties (BCP081). ARS route maps incur additional charges and a first-use upgrade.'
+      : 'ARS route maps and associations are omitted because Route Server deployment is disabled.')
+  }
+  let resourceCount = 0
+  const usedSymbolicNames = new Set<string>()
+
+  const uniqueSymbol = (base: string, prefix: string): string => {
+    const root = bicepIdentifier(base, prefix)
+    let candidate = root
+    let idx = 2
+    while (usedSymbolicNames.has(candidate)) {
+      candidate = `${root}_${idx++}`
+    }
+    usedSymbolicNames.add(candidate)
+    return candidate
+  }
+  const peeringSymbols = new Map(topology.vnetPeerings.map((peering) => [peering.id, {
+    ab: uniqueSymbol(`peer_${peering.id}_a_to_b`, 'peer'), ba: uniqueSymbol(`peer_${peering.id}_b_to_a`, 'peer'),
+  }]))
+
+  const lines: string[] = [
+    '// Generated by Azure Network Simulator (AzNetSim; v2 Bicep Starter)',
+    `// Topology: ${topology.name}`,
+    `param location string = '${escapeBicepString(defaultLoc)}'`,
+    '',
+  ]
+
+  // 1. Route Tables (UDRs + BGP propagation setting)
+  const rtSymbols = new Map<string, string>()
+  for (const rt of topology.udrTables) {
+    const sym = uniqueSymbol(`rt_${rt.id}`, 'rt')
+    rtSymbols.set(rt.id, sym)
+    resourceCount++
+
+    const enabledRoutes = rt.routes.filter((r) => r.enabled)
+    for (const r of enabledRoutes) {
+      if (!cidr(r.prefix)) {
+        warnings.push(`Route table '${rt.name}' route '${r.name}' has invalid CIDR '${r.prefix}'.`)
+      }
+      if (r.nextHopType === 'VirtualAppliance' && (!r.nextHopIp || !ipv4(r.nextHopIp))) {
+        warnings.push(
+          `Route table '${rt.name}' route '${r.name}' uses VirtualAppliance without a valid IPv4 nextHopIp.`,
+        )
+      }
+    }
+
+    lines.push(`resource ${sym} 'Microsoft.Network/routeTables@2024-05-01' = {`)
+    lines.push(`  name: '${escapeBicepString(rt.name)}'`)
+    lines.push(`  location: location`)
+    lines.push(`  properties: {`)
+    lines.push(`    disableBgpRoutePropagation: ${rt.disableBgpRoutePropagation ? 'true' : 'false'}`)
+    if (enabledRoutes.length === 0) {
+      lines.push(`    routes: []`)
+    } else {
+      lines.push(`    routes: [`)
+      for (const r of enabledRoutes) {
+        lines.push(`      {`)
+        lines.push(`        name: '${escapeBicepString(r.name)}'`)
+        lines.push(`        properties: {`)
+        lines.push(`          addressPrefix: '${escapeBicepString(r.prefix)}'`)
+        lines.push(`          nextHopType: '${r.nextHopType}'`)
+        if (r.nextHopType === 'VirtualAppliance' && r.nextHopIp) {
+          lines.push(`          nextHopIpAddress: '${escapeBicepString(r.nextHopIp)}'`)
+        }
+        lines.push(`        }`)
+        lines.push(`      }`)
+      }
+      lines.push(`    ]`)
+    }
+    lines.push(`  }`)
+    lines.push(`}`)
+    lines.push('')
+  }
+
+  const natSymbols = new Map<string, string>()
+  const natNames = new Set<string>()
+  const natPublicNames = new Set<string>()
+  const natName = (name: string) => {
+    const base = name.replace(/[^a-zA-Z0-9_-]/g, '-').replace(/^-+|-+$/g, '').slice(0, 70) || 'nat-resource'
+    let value = base, suffix = 2
+    while (natNames.has(value.toLowerCase())) value = `${base}-${suffix++}`
+    natNames.add(value.toLowerCase())
+    if (value !== name) warnings.push(`NAT resource name '${name}' is exported as '${value}' for a new Azure deployment.`)
+    return escapeBicepString(value)
+  }
+  for (const gateway of topology.inventory?.natGateways ?? []) {
+    const owner = topology.vnets.find((vnet) => vnet.id === gateway.owner.id)!
+    const gatewayLocation = resolveVnetLocation(owner, defaultLoc)
+    const locExpr = gatewayLocation === defaultLoc ? 'location' : `'${escapeBicepString(gatewayLocation)}'`
+    const publicSymbols = new Map<string, string>(), prefixSymbols = new Map<string, string>()
+    for (const id of gateway.publicIpIds) {
+      const ip = topology.inventory!.publicIps.find((ip) => ip.id === id)!
+      const sym = uniqueSymbol(`nat_pip_${id}`, 'pip')
+      publicSymbols.set(id, sym); resourceCount++
+      const publicName = natName(ip.name)
+      natPublicNames.add(publicName.toLowerCase())
+      lines.push(`resource ${sym} 'Microsoft.Network/publicIPAddresses@2024-05-01' = {`,
+        `  name: '${publicName}'`, `  location: ${locExpr}`,
+        `  sku: { name: 'Standard' }`, `  properties: {`, `    publicIPAddressVersion: 'IPv4'`,
+        `    publicIPAllocationMethod: 'Static'`, `  }`, `}`, '')
+    }
+    for (const id of gateway.publicIpPrefixIds ?? []) {
+      const prefix = topology.inventory!.publicIpPrefixes!.find((prefix) => prefix.id === id)!
+      const sym = uniqueSymbol(`nat_prefix_${id}`, 'prefix')
+      prefixSymbols.set(id, sym); resourceCount++
+      lines.push(`resource ${sym} 'Microsoft.Network/publicIPPrefixes@2024-05-01' = {`,
+        `  name: '${natName(prefix.name)}'`, `  location: ${locExpr}`,
+        `  sku: { name: 'Standard' }`, `  properties: {`, `    publicIPAddressVersion: 'IPv4'`,
+        `    prefixLength: ${prefix.prefixLength}`, `  }`, `}`, '')
+    }
+    const sym = uniqueSymbol(`nat_${gateway.id}`, 'nat')
+    natSymbols.set(gateway.id, sym); resourceCount++
+    lines.push(`resource ${sym} 'Microsoft.Network/natGateways@2024-05-01' = {`,
+      `  name: '${natName(gateway.name)}'`, `  location: ${locExpr}`,
+      `  sku: { name: 'Standard' }`, `  properties: {`, `    publicIpAddresses: [`,
+      ...gateway.publicIpIds.map((id) => `      { id: ${publicSymbols.get(id)}.id }`), `    ]`, `    publicIpPrefixes: [`,
+      ...(gateway.publicIpPrefixIds ?? []).map((id) => `      { id: ${prefixSymbols.get(id)}.id }`), `    ]`, `  }`, `}`, '')
+  }
+  if (natSymbols.size) warnings.push('Standard NAT Gateway resources and their public pools are exported. Azure allocates new public addresses; recorded addresses and illustrative SNAT ports are not pinned. Review zone, capacity and security requirements before deployment.')
+  if (topology.vnets.some((vnet) => vnet.subnets.some((subnet) => subnet.internetEgressStatus))) warnings.push('Unknown captured outbound associations are not recreated by this starter. Preserve native JSON and resolve the missing configuration before deployment.')
+
+  // 2. Virtual Networks and Subnets
+  const vnetSymbols = new Map(topology.vnets.map((vnet) => [vnet.id, uniqueSymbol(`vnet_${vnet.id}`, 'vnet')]))
+  const connectivity = generateConnectivityBicep(topology, vnetSymbols, uniqueSymbol, defaultLoc, natPublicNames)
+  resourceCount += connectivity.resourceCount
+  warnings.push(...connectivity.warnings)
+  lines.push(...connectivity.lines)
+  for (const vnet of topology.vnets) {
+    const sym = vnetSymbols.get(vnet.id)!
+    resourceCount++
+
+    const vnetLoc = resolveVnetLocation(vnet, defaultLoc)
+    const locExpr = vnetLoc === defaultLoc ? 'location' : `'${escapeBicepString(vnetLoc)}'`
+
+    const summaries = vnet.summarizedGatewayPrefixes
+    lines.push(`resource ${sym} 'Microsoft.Network/virtualNetworks@${summaries !== undefined ? '2025-07-01' : '2024-05-01'}' = {`)
+    lines.push(`  name: '${escapeBicepString(vnet.name)}'`)
+    lines.push(`  location: ${locExpr}`)
+    lines.push(`  properties: {`)
+    lines.push(`    addressSpace: {`)
+    lines.push(`      addressPrefixes: [`)
+    for (const pfx of vnet.prefixes) {
+      lines.push(`        '${escapeBicepString(pfx)}'`)
+    }
+    lines.push(`      ]`)
+    lines.push(`    }`)
+    if (summaries !== undefined) {
+      lines.push(`    summarizedGatewayPrefixes: {`)
+      lines.push(`      addressPrefixes: [`)
+      for (const prefix of summaries) {
+        lines.push(`        '${escapeBicepString(prefix)}'`)
+      }
+      lines.push(`      ]`)
+      lines.push(`    }`)
+    }
+    lines.push(`    subnets: [`)
+    for (const sub of vnet.subnets) {
+      if (sub.name === 'RouteServerSubnet' && sub.routeTableId) {
+        warnings.push(
+          `VNet '${vnet.name}' RouteServerSubnet should not have a route table associated in Azure.`,
+        )
+      }
+      const rtSym = sub.routeTableId ? rtSymbols.get(sub.routeTableId) : undefined
+      lines.push(`      {`)
+      lines.push(`        name: '${escapeBicepString(sub.name)}'`)
+      lines.push(`        properties: {`)
+      lines.push(`          addressPrefix: '${escapeBicepString(sub.prefix)}'`)
+      if (sub.defaultOutboundAccess !== undefined) lines.push(`          defaultOutboundAccess: ${sub.defaultOutboundAccess}`)
+      const nsg = topology.inventory?.nsgAssociations?.find((binding) => binding.owner.id === vnet.id
+        && binding.target.kind === 'subnet' && binding.target.id === sub.id && binding.status !== 'unknown')
+      const nsgSym = nsg?.nsgId && connectivity.nsgSymbols.get(nsg.nsgId)
+      if (nsgSym) lines.push(`          networkSecurityGroup: { id: ${nsgSym}.id }`)
+      const nat = natGatewayForSubnet(topology, { kind: 'vnet', id: vnet.id }, sub.id)
+      if (nat) lines.push(`          natGateway: { id: ${natSymbols.get(nat.id)}.id }`)
+      if (rtSym && sub.name !== 'RouteServerSubnet') {
+        lines.push(`          routeTable: {`)
+        lines.push(`            id: ${rtSym}.id`)
+        lines.push(`          }`)
+      }
+      if (
+        sub.privateEndpointNetworkPolicies &&
+        sub.name !== 'GatewaySubnet' &&
+        sub.name !== 'RouteServerSubnet' &&
+        sub.name !== 'AzureFirewallSubnet'
+      ) {
+        lines.push(`          privateEndpointNetworkPolicies: '${sub.privateEndpointNetworkPolicies}'`)
+      }
+      lines.push(`        }`)
+      lines.push(`      }`)
+    }
+    lines.push(`    ]`)
+    lines.push(`  }`)
+    lines.push(`}`)
+    lines.push('')
+  }
+
+  // 3. Optional Virtual Network Gateways (VPN / ExpressRoute)
+  const gatewaySymbolsByVnet = new Map<string, string[]>()
+  const gatewaySymbolById = new Map<string, string>()
+  if (includeGateways) {
+    for (const vnet of topology.vnets) {
+      const vnetSym = vnetSymbols.get(vnet.id)
+      if (!vnetSym) continue
+      const hasGwSubnet = vnet.subnets.some((s) => s.name === 'GatewaySubnet')
+      for (const gw of vnet.gateways.filter((g) => g.enabled)) {
+        if (!hasGwSubnet) {
+          warnings.push(
+            `Gateway '${gw.name}' in VNet '${vnet.name}' skipped because no GatewaySubnet is defined.`,
+          )
+          continue
+        }
+        const activeActive = gw.kind === 'Vpn' && Boolean(gw.activeActive)
+        if (gw.kind === 'Vpn') {
+          if (gw.activeActive === undefined) warnings.push(`VPN gateway '${gw.name}' has unspecified mode; export retains the legacy active/standby default. Select a mode explicitly before deployment.`)
+          if (vnet.routeServer?.enabled && vnet.routeServer.branchToBranchTraffic && (!activeActive || gw.asn !== 65515)) {
+            warnings.push(`VPN gateway '${gw.name}' does not meet ARS route-exchange requirements: active/active and ASN 65515 are required, even when VPN BGP is disabled.`)
+          }
+        }
+        const pip1Sym = uniqueSymbol(`pip_${gw.id}_1`, 'pip')
+        resourceCount++
+        lines.push(`resource ${pip1Sym} 'Microsoft.Network/publicIPAddresses@2024-05-01' = {`)
+        lines.push(`  name: '${escapeBicepString(gw.name)}-pip1'`)
+        lines.push(`  location: location`)
+        lines.push(`  sku: { name: 'Standard' }`)
+        lines.push(`  properties: { publicIPAllocationMethod: 'Static' }`)
+        lines.push(`}`)
+        lines.push('')
+
+        let pip2Sym: string | undefined
+        if (activeActive) {
+          pip2Sym = uniqueSymbol(`pip_${gw.id}_2`, 'pip')
+          resourceCount++
+          lines.push(`resource ${pip2Sym} 'Microsoft.Network/publicIPAddresses@2024-05-01' = {`)
+          lines.push(`  name: '${escapeBicepString(gw.name)}-pip2'`)
+          lines.push(`  location: location`)
+          lines.push(`  sku: { name: 'Standard' }`)
+          lines.push(`  properties: { publicIPAllocationMethod: 'Static' }`)
+          lines.push(`}`)
+          lines.push('')
+        }
+
+        const gwSym = uniqueSymbol(`vng_${gw.id}`, 'vng')
+        resourceCount++
+        gatewaySymbolById.set(gw.id, gwSym)
+        const list = gatewaySymbolsByVnet.get(vnet.id) ?? []
+        list.push(gwSym)
+        gatewaySymbolsByVnet.set(vnet.id, list)
+
+        const skuName = gw.kind === 'ExpressRoute' ? 'ErGw1AZ' : 'VpnGw1AZ'
+        const skuTier = gw.kind === 'ExpressRoute' ? 'ErGw1AZ' : 'VpnGw1AZ'
+
+        lines.push(`resource ${gwSym} 'Microsoft.Network/virtualNetworkGateways@2024-05-01' = {`)
+        lines.push(`  name: '${escapeBicepString(gw.name)}'`)
+        lines.push(`  location: location`)
+        lines.push(`  properties: {`)
+        lines.push(`    gatewayType: '${gw.kind}'`)
+        if (gw.kind === 'Vpn') {
+          lines.push(`    vpnType: 'RouteBased'`)
+          lines.push(`    activeActive: ${activeActive ? 'true' : 'false'}`)
+          lines.push(`    enableBgp: ${gw.bgpEnabled ? 'true' : 'false'}`)
+          if (gw.bgpEnabled) {
+            lines.push(`    bgpSettings: {`)
+            lines.push(`      asn: ${gw.asn || 65515}`)
+            lines.push(`    }`)
+          }
+        }
+        lines.push(`    sku: {`)
+        lines.push(`      name: '${skuName}'`)
+        lines.push(`      tier: '${skuTier}'`)
+        lines.push(`    }`)
+        lines.push(`    ipConfigurations: [`)
+        lines.push(`      {`)
+        lines.push(`        name: 'gwipconfig1'`)
+        lines.push(`        properties: {`)
+        lines.push(`          privateIPAllocationMethod: 'Dynamic'`)
+        lines.push(`          subnet: { id: '\${${vnetSym}.id}/subnets/GatewaySubnet' }`)
+        lines.push(`          publicIPAddress: { id: ${pip1Sym}.id }`)
+        lines.push(`        }`)
+        lines.push(`      }`)
+        if (activeActive && pip2Sym) {
+          lines.push(`      {`)
+          lines.push(`        name: 'gwipconfig2'`)
+          lines.push(`        properties: {`)
+          lines.push(`          privateIPAllocationMethod: 'Dynamic'`)
+          lines.push(`          subnet: { id: '\${${vnetSym}.id}/subnets/GatewaySubnet' }`)
+          lines.push(`          publicIPAddress: { id: ${pip2Sym}.id }`)
+          lines.push(`        }`)
+          lines.push(`      }`)
+        }
+        lines.push(`    ]`)
+        lines.push(`  }`)
+        lines.push(`}`)
+        lines.push('')
+      }
+    }
+  }
+
+  // 4. Optional Azure Route Server (Microsoft.Network/virtualHubs with RouteServerSubnet ipConfigurations)
+  if (includeRouteServers) {
+    for (const vnet of topology.vnets) {
+      const ars = vnet.routeServer
+      const vnetSym = vnetSymbols.get(vnet.id)
+      if (!ars || !ars.enabled || !vnetSym) continue
+      const hasArsSubnet = vnet.subnets.some((s) => s.name === 'RouteServerSubnet')
+      if (!hasArsSubnet) {
+        warnings.push(
+          `Azure Route Server '${ars.name}' in VNet '${vnet.name}' skipped because no RouteServerSubnet is defined.`,
+        )
+        continue
+      }
+      const pipSym = uniqueSymbol(`pip_${ars.id}`, 'pip')
+      const arsSym = uniqueSymbol(`ars_${ars.id}`, 'ars')
+      const ipCfgSym = uniqueSymbol(`ars_ipcfg_${ars.id}`, 'ars_ipcfg')
+      const policyApi = ars.routeMaps?.length ? '2026-03-01' : '2024-05-01'
+      resourceCount += 3
+
+      lines.push(`resource ${pipSym} 'Microsoft.Network/publicIPAddresses@2024-05-01' = {`)
+      lines.push(`  name: '${escapeBicepString(ars.name)}-pip'`)
+      lines.push(`  location: location`)
+      lines.push(`  sku: { name: 'Standard' }`)
+      lines.push(`  properties: { publicIPAllocationMethod: 'Static' }`)
+      lines.push(`}`)
+      lines.push('')
+
+      lines.push(`resource ${arsSym} 'Microsoft.Network/virtualHubs@${policyApi}' = {`)
+      lines.push(`  name: '${escapeBicepString(ars.name)}'`)
+      lines.push(`  location: location`)
+      lines.push(`  properties: {`)
+      lines.push(`    sku: 'Standard'`)
+      lines.push(`    allowBranchToBranchTraffic: ${ars.branchToBranchTraffic ? 'true' : 'false'}`)
+      lines.push(`    hubRoutingPreference: '${ars.hubRoutingPreference}'`)
+      lines.push(`  }`)
+      lines.push(`}`)
+      lines.push('')
+
+      const existingVnetGateways = [...(gatewaySymbolsByVnet.get(vnet.id) ?? [])]
+      const list = gatewaySymbolsByVnet.get(vnet.id) ?? []
+      list.push(ipCfgSym)
+      gatewaySymbolsByVnet.set(vnet.id, list)
+
+      lines.push(`resource ${ipCfgSym} 'Microsoft.Network/virtualHubs/ipConfigurations@2024-05-01' = {`)
+      lines.push(`  parent: ${arsSym}`)
+      lines.push(`  name: 'ars-ipconfig1'`)
+      if (existingVnetGateways.length > 0) {
+        lines.push(`  dependsOn: [ ${existingVnetGateways.join(', ')} ]`)
+      }
+      lines.push(`  properties: {`)
+      lines.push(`    subnet: { id: '\${${vnetSym}.id}/subnets/RouteServerSubnet' }`)
+      lines.push(`    publicIPAddress: { id: ${pipSym}.id }`)
+      lines.push(`  }`)
+      lines.push(`}`)
+      lines.push('')
+
+      const mapSymbols = new Map<string, string>()
+      const stringList = (values: string[]) => `[ ${values.map((value) => `'${escapeBicepString(value)}'`).join(', ')} ]`
+      const field = (property: string) => property === 'prefix' ? 'routePrefix' : property === 'asPath' ? 'asPath' : 'community'
+      for (const map of ars.routeMaps ?? []) {
+        const sym = uniqueSymbol(`ars_map_${ars.id}_${map.id}`, 'ars_map')
+        mapSymbols.set(map.id, sym); resourceCount++
+        lines.push(`resource ${sym} 'Microsoft.Network/virtualHubs/routeMaps@${policyApi}' = {`,
+          `  parent: ${arsSym}`, `  name: '${escapeBicepString(map.name)}'`, `  dependsOn: [ ${ipCfgSym} ]`, '  properties: {', '    rules: [')
+        for (const rule of map.rules) {
+          lines.push('      {', `        name: '${escapeBicepString(rule.id)}'`, `        nextStepIfMatched: '${rule.nextStep === 'continue' ? 'Continue' : 'Terminate'}'`, '        matchCriteria: [')
+          const conditions = [
+            ...(rule.prefixes.length ? [{ property: 'prefix', match: rule.match, values: rule.prefixes }] : []),
+            ...(rule.matchConditions ?? []),
+          ]
+          for (const condition of conditions) lines.push(`          { matchCondition: '${condition.match === 'equals' ? 'Equals' : 'Contains'}', ${field(condition.property)}: ${stringList(condition.values)} }`)
+          lines.push('        ]', '        actions: [')
+          if (rule.action === 'drop') lines.push("          { type: 'Drop' }")
+          else {
+            if (rule.action === 'prepend') lines.push(`          { type: 'Add', parameters: [ { asPath: ${stringList(rule.prepend.map(String))} } ] }`)
+            if (rule.action === 'summarize') lines.push(`          { type: 'Replace', parameters: [ { routePrefix: ${stringList(rule.summaryPrefixes)} } ] }`)
+            for (const modification of rule.modifications ?? []) lines.push(`          { type: '${modification.action === 'add' ? 'Add' : modification.action === 'replace' ? 'Replace' : 'Remove'}', parameters: [ { ${field(modification.property)}: ${stringList(modification.values)} } ] }`)
+          }
+          lines.push('        ]', '      }')
+        }
+        lines.push('    ]', '  }', '}', '')
+      }
+      const routingConfiguration = (connectionId: string) => {
+        const binding = ars.routeMapAssignments?.find((assignment) => assignment.connectionId === connectionId)
+        const assignments = (['inbound', 'outbound'] as const).flatMap((direction) => {
+          const symbol = mapSymbols.get(binding?.[`${direction}MapId`] ?? '')
+          return symbol ? [`      ${direction}RouteMap: { id: ${symbol}.id }`] : []
+        })
+        if (assignments.length) lines.push('    routingConfiguration: {', ...assignments, '    }')
+      }
+      const spokeSymbols = new Map<string, string>()
+      for (const { vnet: spoke, peering, active } of azArsSpokes(vnet, topology)) {
+        const binding = ars.routeMapAssignments?.find((assignment) => assignment.connectionId === `vnet:${spoke.id}`)
+        const peers = azArsPeers(vnet, topology).some(({ host }) => host.id === spoke.id)
+        if (!active || !binding && !peers) continue
+        if (!mapSymbols.size) {
+          warnings.push(`ARS spoke connection '${spoke.name}' omitted: Azure requires an existing route map before creating the virtual network connection.`)
+          continue
+        }
+        const sym = uniqueSymbol(`ars_spoke_${ars.id}_${spoke.id}`, 'ars_spoke')
+        spokeSymbols.set(spoke.id, sym); resourceCount++
+        const dependency = peeringSymbols.get(peering.id)!
+        lines.push(`resource ${sym} 'Microsoft.Network/virtualHubs/hubVirtualNetworkConnections@${policyApi}' = {`,
+          `  parent: ${arsSym}`, `  name: 'spoke-${escapeBicepString(spoke.name)}'`,
+          `  dependsOn: [ ${[dependency.ab, dependency.ba, ...([binding?.inboundMapId, binding?.outboundMapId].some((id) => mapSymbols.has(id ?? '')) ? [] : [...mapSymbols.values()].slice(0, 1))].join(', ')} ]`,
+          '  properties: {', `    remoteVirtualNetwork: { id: ${vnetSymbols.get(spoke.id)}.id }`)
+        routingConfiguration(`vnet:${spoke.id}`)
+        lines.push('  }', '}', '')
+      }
+      for (const assignment of ars.routeMapAssignments ?? []) if (assignment.connectionId.startsWith('gateway:') && (assignment.inboundMapId || assignment.outboundMapId)) {
+        warnings.push(`ARS gateway association '${assignment.connectionId}' requires manual configuration in the Azure portal; the route-map definitions are exported, not this gateway assignment.`)
+      }
+      for (const { host, peer: app, connectionId } of azArsPeers(vnet, topology)) {
+        if (!app || !app.bgpEnabled || !app.asn || !ipv4(app.privateIp)) continue
+        if (host.id !== vnet.id && !spokeSymbols.has(host.id)) {
+          warnings.push(`Remote ARS BGP peer '${app.name}' requires a spoke virtual network connection and was omitted.`)
+          continue
+        }
+        const bgpSym = uniqueSymbol(`ars_bgp_${ars.id}_${app.id}`, 'ars_bgp')
+        resourceCount++
+        lines.push(`resource ${bgpSym} 'Microsoft.Network/virtualHubs/bgpConnections@${policyApi}' = {`)
+        lines.push(`  parent: ${arsSym}`)
+        lines.push(`  name: 'peer-${escapeBicepString(app.name)}'`)
+        lines.push(`  dependsOn: [ ${ipCfgSym} ]`)
+        lines.push(`  properties: {`)
+        lines.push(`    peerAsn: ${app.asn}`)
+        lines.push(`    peerIp: '${escapeBicepString(app.privateIp)}'`)
+        if (host.id === vnet.id) routingConfiguration(connectionId)
+        else lines.push(`    hubVirtualNetworkConnection: { id: ${spokeSymbols.get(host.id)}.id }`)
+        lines.push(`  }`)
+        lines.push(`}`)
+        lines.push('')
+      }
+    }
+  }
+
+  // 5. Bidirectional VNet Peerings
+  for (const peering of topology.vnetPeerings.filter((p) => p.enabled)) {
+    const vnetASym = vnetSymbols.get(peering.vnetAId)
+    const vnetBSym = vnetSymbols.get(peering.vnetBId)
+    const vnetA = topology.vnets.find((v) => v.id === peering.vnetAId)
+    const vnetB = topology.vnets.find((v) => v.id === peering.vnetBId)
+    if (!vnetASym || !vnetBSym || !vnetA || !vnetB) {
+      warnings.push(`Peering '${peering.name}' references an unknown VNet and was skipped.`)
+      continue
+    }
+
+    const { ab: peerABSym, ba: peerBASym } = peeringSymbols.get(peering.id)!
+    resourceCount += 2
+
+    const localGwDepsForA = peering.aToB.allowGatewayTransit
+      ? [...(gatewaySymbolsByVnet.get(peering.vnetAId) ?? [])]
+      : []
+    const localGwDepsForB = peering.bToA.allowGatewayTransit
+      ? [...(gatewaySymbolsByVnet.get(peering.vnetBId) ?? [])]
+      : []
+    const remoteGwDepsForA = peering.aToB.useRemoteGateways
+      ? [...(gatewaySymbolsByVnet.get(peering.vnetBId) ?? [])]
+      : []
+    const remoteGwDepsForB = peering.bToA.useRemoteGateways
+      ? [...(gatewaySymbolsByVnet.get(peering.vnetAId) ?? [])]
+      : []
+
+    if (peering.aToB.useRemoteGateways && remoteGwDepsForA.length === 0) {
+      warnings.push(
+        `Peering '${peering.name}' (${vnetA.name} -> ${vnetB.name}) sets useRemoteGateways=true, which requires a deployed gateway in '${vnetB.name}'.`,
+      )
+    }
+    if (peering.bToA.useRemoteGateways && remoteGwDepsForB.length === 0) {
+      warnings.push(
+        `Peering '${peering.name}' (${vnetB.name} -> ${vnetA.name}) sets useRemoteGateways=true, which requires a deployed gateway in '${vnetA.name}'.`,
+      )
+    }
+
+    const depsForA = [
+      ...localGwDepsForA,
+      ...(peering.aToB.useRemoteGateways && remoteGwDepsForA.length > 0
+        ? [...remoteGwDepsForA, ...(peering.bToA.allowGatewayTransit ? [peerBASym] : [])]
+        : []),
+    ]
+    const depsForB = [
+      ...localGwDepsForB,
+      ...(peering.bToA.useRemoteGateways && remoteGwDepsForB.length > 0
+        ? [...remoteGwDepsForB, ...(peering.aToB.allowGatewayTransit ? [peerABSym] : [])]
+        : []),
+    ]
+
+    lines.push(
+      `resource ${peerABSym} 'Microsoft.Network/virtualNetworks/virtualNetworkPeerings@2024-05-01' = {`,
+    )
+    lines.push(`  parent: ${vnetASym}`)
+    lines.push(`  name: '${escapeBicepString(peering.name)}-to-${escapeBicepString(vnetB.name)}'`)
+    if (depsForA.length > 0) {
+      lines.push(`  dependsOn: [ ${depsForA.join(', ')} ]`)
+    }
+    lines.push(`  properties: {`)
+    lines.push(`    remoteVirtualNetwork: { id: ${vnetBSym}.id }`)
+    if (peering.scope?.type === 'subnets') {
+      lines.push('    peerCompleteVnets: false', '    enableOnlyIPv6Peering: false',
+        `    localSubnetNames: [${peering.scope.subnetAIds.map((id) => `'${escapeBicepString(vnetA.subnets.find((subnet) => subnet.id === id)!.name)}'`).join(', ')}]`,
+        `    remoteSubnetNames: [${peering.scope.subnetBIds.map((id) => `'${escapeBicepString(vnetB.subnets.find((subnet) => subnet.id === id)!.name)}'`).join(', ')}]`)
+    }
+    lines.push(
+      `    allowVirtualNetworkAccess: ${peering.aToB.allowVirtualNetworkAccess ? 'true' : 'false'}`,
+    )
+    lines.push(`    allowForwardedTraffic: ${peering.aToB.allowForwardedTraffic ? 'true' : 'false'}`)
+    lines.push(`    allowGatewayTransit: ${peering.aToB.allowGatewayTransit ? 'true' : 'false'}`)
+    lines.push(
+      `    useRemoteGateways: ${peering.aToB.useRemoteGateways && remoteGwDepsForA.length > 0 ? 'true' : 'false'}`,
+    )
+    lines.push(`  }`)
+    lines.push(`}`)
+    lines.push('')
+
+    lines.push(
+      `resource ${peerBASym} 'Microsoft.Network/virtualNetworks/virtualNetworkPeerings@2024-05-01' = {`,
+    )
+    lines.push(`  parent: ${vnetBSym}`)
+    lines.push(`  name: '${escapeBicepString(peering.name)}-to-${escapeBicepString(vnetA.name)}'`)
+    if (depsForB.length > 0) {
+      lines.push(`  dependsOn: [ ${depsForB.join(', ')} ]`)
+    }
+    lines.push(`  properties: {`)
+    lines.push(`    remoteVirtualNetwork: { id: ${vnetASym}.id }`)
+    if (peering.scope?.type === 'subnets') {
+      lines.push('    peerCompleteVnets: false', '    enableOnlyIPv6Peering: false',
+        `    localSubnetNames: [${peering.scope.subnetBIds.map((id) => `'${escapeBicepString(vnetB.subnets.find((subnet) => subnet.id === id)!.name)}'`).join(', ')}]`,
+        `    remoteSubnetNames: [${peering.scope.subnetAIds.map((id) => `'${escapeBicepString(vnetA.subnets.find((subnet) => subnet.id === id)!.name)}'`).join(', ')}]`)
+    }
+    lines.push(
+      `    allowVirtualNetworkAccess: ${peering.bToA.allowVirtualNetworkAccess ? 'true' : 'false'}`,
+    )
+    lines.push(`    allowForwardedTraffic: ${peering.bToA.allowForwardedTraffic ? 'true' : 'false'}`)
+    lines.push(`    allowGatewayTransit: ${peering.bToA.allowGatewayTransit ? 'true' : 'false'}`)
+    lines.push(
+      `    useRemoteGateways: ${peering.bToA.useRemoteGateways && remoteGwDepsForB.length > 0 ? 'true' : 'false'}`,
+    )
+    lines.push(`  }`)
+    lines.push(`}`)
+    lines.push('')
+  }
+
+  // 6. Optional Local Network Gateways & S2S VPN Connections
+  if (includeGateways) {
+    const lgwSymbolBySiteId = new Map<string, string>()
+    for (const conn of topology.vpnConnections.filter(
+      (c) => c.enabled && c.targetKind === 'vnet-gateway',
+    )) {
+      const gwSym = gatewaySymbolById.get(conn.targetId)
+      const site = topology.sites.find((s) => s.id === conn.siteId)
+      if (!gwSym || !site) continue
+
+      let lgwSym = lgwSymbolBySiteId.get(site.id)
+      if (!lgwSym) {
+        lgwSym = uniqueSymbol(`lgw_${site.id}`, 'lgw')
+        lgwSymbolBySiteId.set(site.id, lgwSym)
+        resourceCount++
+        const firstPrefix = site.prefixes[0] ?? '10.250.0.0/16'
+        const baseOctets = firstPrefix.split('/')[0]?.split('.') ?? ['10', '250', '0', '0']
+        const defaultPeerIp =
+          baseOctets.length === 4
+            ? `${baseOctets[0]}.${baseOctets[1]}.${baseOctets[2]}.254`
+            : '10.250.0.254'
+
+        warnings.push(
+          `Local Network Gateway '${site.name}' uses placeholder public IP '198.51.100.10'; update gatewayIpAddress before connecting a physical device.`,
+        )
+        lines.push(`resource ${lgwSym} 'Microsoft.Network/localNetworkGateways@2024-05-01' = {`)
+        lines.push(`  name: '${escapeBicepString(site.name)}'`)
+        lines.push(`  location: location`)
+        lines.push(`  properties: {`)
+        lines.push(`    gatewayIpAddress: '198.51.100.10'`)
+        lines.push(`    localNetworkAddressSpace: {`)
+        lines.push(`      addressPrefixes: [`)
+        if (conn.bgpEnabled) {
+          lines.push(`        '${defaultPeerIp}/32'`)
+        } else {
+          for (const pfx of site.prefixes.length > 0 ? site.prefixes : ['10.250.0.0/16']) {
+            lines.push(`        '${escapeBicepString(pfx)}'`)
+          }
+        }
+        lines.push(`      ]`)
+        lines.push(`    }`)
+        if (conn.bgpEnabled) {
+          lines.push(`    bgpSettings: {`)
+          lines.push(`      asn: ${site.asn || 65100}`)
+          lines.push(`      bgpPeeringAddress: '${defaultPeerIp}'`)
+          lines.push(`    }`)
+        }
+        lines.push(`  }`)
+        lines.push(`}`)
+        lines.push('')
+      }
+
+      const connSym = uniqueSymbol(`vpn_${conn.id}`, 'vpn')
+      resourceCount++
+      lines.push(`resource ${connSym} 'Microsoft.Network/connections@2024-05-01' = {`)
+      lines.push(`  name: '${escapeBicepString(conn.name)}'`)
+      lines.push(`  location: location`)
+      lines.push(`  properties: {`)
+      lines.push(`    connectionType: 'IPsec'`)
+      lines.push(`    virtualNetworkGateway1: { id: ${gwSym}.id, properties: {} }`)
+      lines.push(`    localNetworkGateway2: { id: ${lgwSym}.id, properties: {} }`)
+      lines.push(`    enableBgp: ${conn.bgpEnabled ? 'true' : 'false'}`)
+      lines.push(`    sharedKey: 'ReplaceWithSecureSharedKey2026!'`)
+      lines.push(`  }`)
+      lines.push(`}`)
+      lines.push('')
+    }
+  }
+
+  return {
+    text: lines.join('\n').trimEnd() + '\n',
+    warnings,
+    resourceCount,
+  }
+}
